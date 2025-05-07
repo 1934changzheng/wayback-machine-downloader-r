@@ -61,6 +61,15 @@ option_parser = OptionParser.new do |opts|
   opts.on("-v", "--version", "Display version") do |t|
     options[:version] = t
   end
+
+  # Add this to the OptionParser block in bin/wayback_machine_downloader
+  opts.on("-r", "--[no-]rewrite-urls", "Rewrite URLs to make them relative for local browsing (Default: true)") do |r|
+    options[:rewrite_urls] = r
+  end
+
+  # Usage example:
+  # wayback_machine_downloader http://example.com --rewrite-urls      # Enable URL rewriting (default)
+  # wayback_machine_downloader http://example.com --no-rewrite-urls   # Disable URL rewriting
 end.parse!
 
 if (base_url = ARGV[-1])

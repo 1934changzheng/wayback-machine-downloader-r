@@ -6,6 +6,7 @@ require 'open-uri'
 require 'fileutils'
 require 'cgi'
 require 'json'
+require 'nokogiri'
 require_relative 'wayback_machine_downloader/tidy_bytes'
 require_relative 'wayback_machine_downloader/to_regex'
 require_relative 'wayback_machine_downloader/archive_api'
@@ -18,7 +19,7 @@ class WaybackMachineDownloader
 
   attr_accessor :base_url, :exact_url, :directory, :all_timestamps,
     :from_timestamp, :to_timestamp, :only_filter, :exclude_filter, 
-    :all, :maximum_pages, :threads_count
+    :all, :maximum_pages, :threads_count, :rewrite_urls
 
   def initialize params
     @base_url = params[:base_url]
@@ -32,6 +33,7 @@ class WaybackMachineDownloader
     @all = params[:all]
     @maximum_pages = params[:maximum_pages] ? params[:maximum_pages].to_i : 100
     @threads_count = params[:threads_count].to_i
+    @rewrite_urls = params[:rewrite_urls].nil? ? true : params[:rewrite_urls]  # Default to true
   end
 
   def backup_name
@@ -251,7 +253,8 @@ class WaybackMachineDownloader
     end
   end
 
-  def download_file (file_remote_info, http)
+  # Modified download_file method with URL rewriting
+  def download_file(file_remote_info, http)
     current_encoding = "".encoding
     file_url = file_remote_info[:file_url].encode(current_encoding)
     file_id = file_remote_info[:file_id]
@@ -276,9 +279,17 @@ class WaybackMachineDownloader
         structure_dir_path dir_path
         open(file_path, "wb") do |file|
           begin
+            content = ""
             http.get(URI("https://web.archive.org/web/#{file_timestamp}id_/#{file_url}")) do |body|
-              file.write(body)
+              content += body
             end
+            
+            # Process content to rewrite URLs if enabled and file is HTML or CSS
+            if @rewrite_urls && should_rewrite_urls?(file_path)
+              content = rewrite_urls_in_content(content, file_path, file_url)
+            end
+            
+            file.write(content)
           rescue OpenURI::HTTPError => e
             puts "#{file_url} # #{e}"
             if @all
@@ -307,6 +318,170 @@ class WaybackMachineDownloader
         puts "#{file_url} # #{file_path} already exists. (#{@processed_file_count}/#{file_list_by_timestamp.size})"
       end
     end
+  end
+
+  # Determine if we should rewrite URLs in this file based on extension
+  def should_rewrite_urls?(file_path)
+    extension = File.extname(file_path).downcase
+    ['.html', '.htm', '.css', '.js'].include?(extension)
+  end
+  
+  # Rewrite URLs in HTML, CSS and JS content to make them relative
+  def rewrite_urls_in_content(content, file_path, original_url)
+    extension = File.extname(file_path).downcase
+    
+    case extension
+    when '.html', '.htm'
+      rewrite_urls_in_html(content, file_path, original_url)
+    when '.css'
+      rewrite_urls_in_css(content, file_path, original_url)
+    when '.js'
+      rewrite_urls_in_js(content, file_path, original_url)
+    else
+      content # Return unchanged for other file types
+    end
+  end
+  
+  # Rewrite URLs in HTML documents
+  def rewrite_urls_in_html(content, file_path, original_url)
+    begin
+      doc = Nokogiri::HTML(content)
+      
+      # Get the relative path of this file from the backup root
+      file_relative_path = file_path.sub(backup_path, '')
+      file_directory = File.dirname(file_relative_path)
+      
+      # Handle links (a href)
+      doc.css('a[href]').each do |link|
+        href = link['href']
+        next if href.nil? || href.empty? || href.start_with?('#') || href.start_with?('javascript:') || href.start_with?('mailto:')
+        link['href'] = convert_to_relative_path(href, file_directory)
+      end
+      
+      # Handle images, scripts, links, iframes, etc
+      {
+        'img' => 'src',
+        'script' => 'src',
+        'link' => 'href',
+        'iframe' => 'src',
+        'embed' => 'src',
+        'source' => 'src',
+        'object' => 'data'
+      }.each do |tag, attr|
+        doc.css("#{tag}[#{attr}]").each do |element|
+          src = element[attr]
+          next if src.nil? || src.empty? || src.start_with?('data:') || src.start_with?('javascript:')
+          element[attr] = convert_to_relative_path(src.strip, file_directory)
+        end
+      end
+      
+      # Handle CSS background images and imports
+      doc.css('style').each do |style|
+        style.content = rewrite_urls_in_css(style.content, file_path, original_url)
+      end
+      
+      # Handle inline styles
+      doc.css('[style]').each do |element|
+        element['style'] = rewrite_urls_in_css("{a{#{element['style']}}}", file_path, original_url).gsub(/^a\{|\}$/, '')
+      end
+      
+      # Convert the document back to string
+      doc.to_s
+    rescue => e
+      puts "Error rewriting HTML URLs in #{file_path}: #{e.message}"
+      content # Return original content if rewriting failed
+    end
+  end
+  
+  # Rewrite URLs in CSS files
+  def rewrite_urls_in_css(content, file_path, original_url)
+    begin
+      file_relative_path = file_path.sub(backup_path, '')
+      file_directory = File.dirname(file_relative_path)
+      
+      # Handle url() and @import rules
+      content.gsub(/url\(['"]?([^'")]+)['"]?\)/i) do
+        url = $1.strip
+        next "url(#{url})" if url.start_with?('data:') # Skip data URLs
+        
+        relative_url = convert_to_relative_path(url, file_directory)
+        "url(#{relative_url})"
+      end
+    rescue => e
+      puts "Error rewriting CSS URLs in #{file_path}: #{e.message}"
+      content # Return original content if rewriting failed
+    end
+  end
+  
+  # Rewrite URLs in JavaScript (basic approach, may need refinement)
+  def rewrite_urls_in_js(content, file_path, original_url)
+    # This is a simple approach that may not catch all JS URLs
+    # For a more comprehensive solution, a JavaScript parser would be needed
+    file_relative_path = file_path.sub(backup_path, '')
+    file_directory = File.dirname(file_relative_path)
+    
+    content.gsub(/(["'])((https?:)?\/\/[^"']+)(["'])/) do
+      quote = $1
+      url = $2
+      closing_quote = $4
+      
+      if url.include?(backup_name) # Only replace URLs for our domain
+        relative_url = convert_to_relative_path(url, file_directory)
+        "#{quote}#{relative_url}#{closing_quote}"
+      else
+        "#{quote}#{url}#{closing_quote}" # Keep external URLs as is
+      end
+    end
+  end
+  
+  # Convert an absolute URL to a relative path
+  def convert_to_relative_path(url, file_directory)
+    # Return unchanged if already relative or external
+    return url if url.start_with?('./') || url.start_with?('../') || url == '/'
+    
+    # Handle protocol-relative URLs
+    if url.start_with?('//') 
+      url = "http:#{url}" # Add protocol for parsing
+    end
+    
+    begin
+      uri = URI.parse(url)
+      
+      # Leave external URLs unchanged
+      return url if uri.host && !url_belongs_to_site?(uri.host)
+      
+      # Extract path from the URL (remove domain, protocol, etc.)
+      path = uri.path
+      path = '/' if path.nil? || path.empty?
+      
+      # Clean up path
+      path = path.gsub(/^\//, '') # Remove leading slash
+      
+      # Calculate the relative path from the current file to the target
+      if file_directory == '/' || file_directory == '.'
+        "./#{path}"
+      else
+        # Count levels in file_directory to determine how many "../" we need
+        levels = file_directory.split('/').size - 1
+        prefix = levels > 0 ? '../' * levels : './'
+        "#{prefix}#{path}"
+      end
+    rescue URI::InvalidURIError => e
+      # If we can't parse the URL, return it unchanged
+      url
+    end
+  end
+  
+  # Check if a URL belongs to the site we're downloading
+  def url_belongs_to_site?(host)
+    # Extract domain from the base_url for comparison
+    base_host = if @base_url.include? '//'
+                  @base_url.split('/')[2]
+                else
+                  @base_url
+                end
+    
+    host == base_host || host.end_with?(".#{base_host}")
   end
 
   def file_queue
