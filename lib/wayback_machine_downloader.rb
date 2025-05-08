@@ -375,6 +375,25 @@ class WaybackMachineDownloader
         end
       end
       
+      # Handle srcset attributes (for responsive images)
+      doc.css('[srcset]').each do |element|
+        srcset = element['srcset']
+        next if srcset.nil? || srcset.empty?
+        
+        # Process each URL in the srcset
+        new_srcset = srcset.split(',').map do |src_item|
+          parts = src_item.strip.split(/\s+/, 2)
+          url = parts[0]
+          descriptor = parts[1] || ''
+          
+          # Convert the URL to a relative path
+          new_url = convert_to_relative_path(url, file_directory)
+          "#{new_url} #{descriptor}".strip
+        end.join(', ')
+        
+        element['srcset'] = new_srcset
+      end
+      
       # Handle CSS background images and imports
       doc.css('style').each do |style|
         style.content = rewrite_urls_in_css(style.content, file_path, original_url)
