@@ -436,8 +436,8 @@ class WaybackMachineDownloader
   
   # Convert an absolute URL to a relative path
   def convert_to_relative_path(url, file_directory)
-    # Return unchanged if already relative or external
-    return url if url.start_with?('./') || url.start_with?('../') || url == '/'
+    # Return unchanged if already relative (except for simple /) or external
+    return url if (url.start_with?('./') || url.start_with?('../')) && url != '/'
     
     # Handle protocol-relative URLs
     if url.start_with?('//') 
@@ -457,21 +457,51 @@ class WaybackMachineDownloader
       # Clean up path
       path = path.gsub(/^\//, '') # Remove leading slash
       
-      # Calculate the relative path from the current file to the target
-      if file_directory == '/' || file_directory == '.'
-        "./#{path}"
-      else
-        # Count levels in file_directory to determine how many "../" we need
-        levels = file_directory.split('/').size - 1
-        prefix = levels > 0 ? '../' * levels : './'
-        "#{prefix}#{path}"
+      # We need to know the file directory relative to the backup root
+      # This is to prevent duplicate directory names in paths
+      root_directory = backup_path.sub(/\/$/, '')
+      if file_directory.start_with?(backup_name)
+        # Convert from domain-based path to relative path
+        file_directory = file_directory.sub(/^#{backup_name}\//, '')
       end
+      
+      # Split paths into components
+      file_parts = file_directory.split('/')
+      target_parts = path.split('/')
+      
+      # Skip common prefix path components to avoid duplications
+      common_prefix_length = 0
+      [file_parts.length, target_parts.length].min.times do |i|
+        break if file_parts[i] != target_parts[i]
+        common_prefix_length = i + 1
+      end
+      
+      # Calculate the number of directories to go up
+      up_levels = file_parts.length - common_prefix_length
+      
+      # Build the relative path
+      if up_levels == 0 && common_prefix_length == 0
+        # No common prefix and no need to go up
+        result_path = "./#{path}"
+      else
+        # Need to go up some levels
+        prefix = up_levels > 0 ? '../' * up_levels : './'
+        remaining_path = target_parts[common_prefix_length..-1].join('/')
+        result_path = "#{prefix}#{remaining_path}"
+      end
+      
+      # Add query string and fragment if present
+      result_path += "?#{uri.query}" if uri.query
+      result_path += "##{uri.fragment}" if uri.fragment
+      
+      result_path
     rescue URI::InvalidURIError => e
       # If we can't parse the URL, return it unchanged
+      puts "Warning: Could not parse URL '#{url}': #{e.message}"
       url
     end
   end
-  
+
   # Check if a URL belongs to the site we're downloading
   def url_belongs_to_site?(host)
     # Extract domain from the base_url for comparison
